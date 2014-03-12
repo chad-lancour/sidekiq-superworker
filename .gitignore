@@ -2,4 +2,4 @@
 .bundle/
 Gemfile.lock
 log/*.log
-pkg/
+pkg/.git_disabled
