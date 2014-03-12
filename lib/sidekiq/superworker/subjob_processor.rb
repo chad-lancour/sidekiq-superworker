@@ -5,8 +5,11 @@ module Sidekiq
         def enqueue(subjob)
           Superworker.debug "#{subjob.to_info}: Trying to enqueue"
           # Only enqueue subjobs that aren't running, complete, etc
-          return unless subjob.status == 'initialized'
-          
+          if subjob.status != 'initialized'
+            Superworker.debug "#{subjob.to_info}: Enqueue failed, status = #{subjob.status}"
+            return
+          end
+
           Superworker.debug "#{subjob.to_info}: Enqueueing"
           # If this is a parallel subjob, enqueue all of its children
           if subjob.subworker_class == 'parallel'
@@ -119,7 +122,31 @@ module Sidekiq
             # If a next subjob is present, enqueue it
             next_subjob = subjob.next
             if next_subjob
-              enqueue(next_subjob)
+              # OK this is where the problem is, was. If a superworker has sequential groups of parallel workers, that all finish very quickly and generally at the same time - one or more of them will basically end up here at the same time, grabbing the same next sub job. That next sub job would be the next sequential parallel group. What would have happened is the next parallel group would get sent to sidekiq multiple times!
+              # The whole approach of this fix was to minimally change code. Overall the fix is a band-aid.
+              # The quick fix was to lock the next subjob row, update it to an interim status of 'queued' to ensure multiple complete subjobs would not pick it up. Then pass the original next_subjob with the original status of initialized - because I did not want to change the enqueue logic that only processes initialized.
+              # During debugging and testing, I implemented optimistic locking on the sidekiq_superworker_subjobs table by adding lock_version col and setting ActiveRecord::Base.lock_optimistically = true. The result overall, is that there are several places where the code is actually updating subjob records that are stale. Though most of the time it's just the updated_at field that is stale.
+              # !! I think the proper fix would involve thoroughly decoupling the subjob complete process from the enqueue process.
+              #   1. refactor code to ensure that each subjob is only updating it's own subjob record. Don't touch parents, and relatives, and children, etc.
+              #   2. create a seperate process in it's own thread that is responsible for monitoring parallel, batch and superworker job states. this process would determine what's next, properly update subjob records, and sending subjobs to sidekiq. overall this might entail using a proper queuing mechanism designed for highly parallel environments and could better support multi-node sidekiq clients...
+
+              enqueue_next_job = false
+              next_subjob.with_lock do
+                # ensure we are only fetching next subjobs that are in initialized state.
+                # !! skipping subjob.next method because
+                #   a. we don't want the relatives where clause ( self.class.where(superjob_id: superjob_id) ) because it causes mysql to scan the superjob_id index and in the process it will eagerly lock all subjob rows for this superjob! PLUS subjob.id is primary key - just use that for next subjob id.
+                #   b. we want to ensure that we only get next subjobs that are in state initliazed.
+                locked_next_subjob = Sidekiq::Superworker::Subjob.lock.where( { id: next_subjob.id, status: 'initialized' } ).first
+                if locked_next_subjob
+                  locked_next_subjob.update_attributes( status: 'queued' )
+                  Superworker.debug "#{subjob.to_info}: Enqueueing Next Subjob ID #{next_subjob.id}, New DB Status = #{locked_next_subjob.status}, Enqueueing with Original Status = #{next_subjob.status}"
+                  enqueue_next_job = true
+                else
+                  Superworker.debug "#{subjob.to_info}: NOT Enqueueing Next Subjob ID #{next_subjob.id}. Multiple Subjobs attempting to enqueue."
+                  enqueue_next_job = false
+                end
+              end
+              enqueue(next_subjob) if enqueue_next_job
               return
             end
 
